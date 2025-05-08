@@ -1,174 +1,1 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
-
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
-import "@account-abstraction/contracts/interfaces/UserOperation.sol";
-import "@account-abstraction/contracts/interfaces/IAccount.sol";
-import "@account-abstraction/contracts/core/BaseAccount.sol";
-
-contract SmartPayWallet is BaseAccount {
-    using ECDSA for bytes32;
-
-    address public owner;
-    address public recoveryAddress;
-    uint256 public recoveryInitiatedAt;
-    address public pendingRecoveryOwner;
-    uint256 public constant RECOVERY_DELAY = 2 days;
-
-    address[] public guardians;
-    mapping(address => bool) public isGuardian;
-    mapping(address => bool) public guardianApprovals;
-    uint256 public constant REQUIRED_GUARDIAN_APPROVALS = 2;
-    uint256 public guardianApprovalCount;
-
-    IEntryPoint private immutable _entryPoint;
-
-    event OwnerChanged(address indexed oldOwner, address indexed newOwner);
-    event RecoveryAddressSet(address indexed newRecovery);
-    event RecoveryInitiated(address indexed by, address indexed newOwner, uint256 timestamp);
-    event RecoveryFinalized(address indexed newOwner);
-    event RecoveryCancelled();
-    event GuardianAdded(address guardian);
-    event GuardianRemoved(address guardian);
-    event GuardianApproved(address guardian);
-    event FeeTransfered(address indexed to, address indexed feeReceiver, uint256 feeAmount);
-
-    constructor(IEntryPoint _ep, address initialOwner) {
-        _entryPoint = _ep;
-        owner = initialOwner;
-    }
-
-    function validateUserOp(
-        UserOperation calldata userOp,
-        bytes32 userOpHash,
-        uint256 /* missingAccountFunds */
-    ) external view override returns (uint256 validationData) {
-        require(msg.sender == address(_entryPoint), "Not from EntryPoint");
-        address recovered = ECDSA.recover(
-            MessageHashUtils.toEthSignedMessageHash(userOpHash),
-            userOp.signature
-        );
-        require(recovered == owner, "Invalid signature");
-        return 0;
-    }
-
-    function execute(address dest, uint256 value, bytes calldata func) external {
-        require(msg.sender == address(_entryPoint), "Not from EntryPoint");
-
-        uint256 fee = value / 100; // 1%
-        uint256 totalAmount = value + fee;
-        require(address(this).balance >= totalAmount, "Insufficient balance for transfer + fee");
-
-        // Отправляем основную сумму
-        (bool sentMain, ) = dest.call{value: value}(func);
-        require(sentMain, "Main transfer failed");
-
-        // Отправляем комиссию себе (владельцу), либо фиксированному сборщику
-        address feeReceiver = owner; // можно заменить на фиксированный адрес
-        (bool sentFee, ) = feeReceiver.call{value: fee}("");
-        require(sentFee, "Fee transfer failed");
-
-        emit FeeTransfered(dest, feeReceiver, fee);
-    }
-
-    function executeBatch(address[] calldata dests, bytes[] calldata funcs) external {
-        require(msg.sender == address(_entryPoint), "Not from EntryPoint");
-        require(dests.length == funcs.length, "Mismatched inputs");
-
-        for (uint256 i = 0; i < dests.length; i++) {
-            (bool success,) = dests[i].call(funcs[i]);
-            require(success, "Batch execution failed");
-        }
-    }
-
-    function changeOwner(address newOwner) external {
-        require(msg.sender == owner, "Not owner");
-        emit OwnerChanged(owner, newOwner);
-        owner = newOwner;
-    }
-
-    function setRecoveryAddress(address newRecovery) external {
-        require(msg.sender == owner, "Not owner");
-        recoveryAddress = newRecovery;
-        emit RecoveryAddressSet(newRecovery);
-    }
-
-    function addGuardian(address guardian) external {
-        require(msg.sender == owner, "Only owner can add guardian");
-        require(!isGuardian[guardian], "Already guardian");
-        guardians.push(guardian);
-        isGuardian[guardian] = true;
-        emit GuardianAdded(guardian);
-    }
-
-    function removeGuardian(address guardian) external {
-        require(msg.sender == owner, "Only owner can remove guardian");
-        require(isGuardian[guardian], "Not a guardian");
-        isGuardian[guardian] = false;
-        for (uint256 i = 0; i < guardians.length; i++) {
-            if (guardians[i] == guardian) {
-                guardians[i] = guardians[guardians.length - 1];
-                guardians.pop();
-                break;
-            }
-        }
-        emit GuardianRemoved(guardian);
-    }
-
-    function approveRecovery(address newOwner) external {
-        require(isGuardian[msg.sender], "Not guardian");
-        require(!guardianApprovals[msg.sender], "Already approved");
-        guardianApprovals[msg.sender] = true;
-        guardianApprovalCount++;
-        emit GuardianApproved(msg.sender);
-
-        if (guardianApprovalCount >= REQUIRED_GUARDIAN_APPROVALS) {
-            recoveryInitiatedAt = block.timestamp;
-            pendingRecoveryOwner = newOwner;
-            guardianApprovalCount = 0;
-            for (uint256 i = 0; i < guardians.length; i++) {
-                guardianApprovals[guardians[i]] = false;
-            }
-            emit RecoveryInitiated(msg.sender, newOwner, block.timestamp);
-        }
-    }
-
-    function finalizeRecovery() external {
-        require(pendingRecoveryOwner != address(0), "No pending recovery");
-        require(block.timestamp >= recoveryInitiatedAt + RECOVERY_DELAY, "Recovery delay not passed");
-        emit OwnerChanged(owner, pendingRecoveryOwner);
-        emit RecoveryFinalized(pendingRecoveryOwner);
-        owner = pendingRecoveryOwner;
-        pendingRecoveryOwner = address(0);
-        recoveryInitiatedAt = 0;
-    }
-
-    function cancelRecovery() external {
-        require(msg.sender == owner, "Only owner can cancel");
-        pendingRecoveryOwner = address(0);
-        recoveryInitiatedAt = 0;
-        guardianApprovalCount = 0;
-        for (uint256 i = 0; i < guardians.length; i++) {
-            guardianApprovals[guardians[i]] = false;
-        }
-        emit RecoveryCancelled();
-    }
-
-    receive() external payable {}
-
-    function entryPoint() public view override returns (IEntryPoint) {
-        return _entryPoint;
-    }
-
-    function _validateSignature(
-        UserOperation calldata userOp,
-        bytes32 userOpHash
-    ) internal view override returns (uint256 validationData) {
-        address recovered = ECDSA.recover(
-            MessageHashUtils.toEthSignedMessageHash(userOpHash),
-            userOp.signature
-        );
-        return recovered == owner ? 0 : 1;
-    }
-}
+// SPDX-License-Identifier: MITpragma solidity ^0.8.28;import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";import "@account-abstraction/contracts/interfaces/UserOperation.sol";import "@account-abstraction/contracts/interfaces/IAccount.sol";import "@account-abstraction/contracts/core/BaseAccount.sol";import "@openzeppelin/contracts/token/ERC20/IERC20.sol";contract SmartPayWallet is BaseAccount {    using ECDSA for bytes32;    address public owner;    address public recoveryAddress;    uint256 public recoveryInitiatedAt;    address public pendingRecoveryOwner;    uint256 public constant RECOVERY_DELAY = 2 days;    address[] public guardians;    mapping(address => bool) public isGuardian;    mapping(address => bool) public guardianApprovals;    uint256 public constant REQUIRED_GUARDIAN_APPROVALS = 2;    uint256 public guardianApprovalCount;    IEntryPoint private immutable _entryPoint;    event OwnerChanged(address indexed oldOwner, address indexed newOwner);    event RecoveryAddressSet(address indexed newRecovery);    event RecoveryInitiated(address indexed by, address indexed newOwner, uint256 timestamp);    event RecoveryFinalized(address indexed newOwner);    event RecoveryCancelled();    event GuardianAdded(address guardian);    event GuardianRemoved(address guardian);    event GuardianApproved(address guardian);    event FeeTransfered(address indexed to, address indexed feeReceiver, uint256 feeAmount);    constructor(IEntryPoint _ep, address initialOwner) {        _entryPoint = _ep;        owner = initialOwner;    }    function validateUserOp(        UserOperation calldata userOp,        bytes32 userOpHash,        uint256 /* missingAccountFunds */    ) external view override returns (uint256 validationData) {        require(msg.sender == address(_entryPoint), "Not from EntryPoint");        address recovered = ECDSA.recover(            MessageHashUtils.toEthSignedMessageHash(userOpHash),            userOp.signature        );        require(recovered == owner, "Invalid signature");        return 0;    }     function execute(address dest, uint256 value, bytes calldata func) external {         require(msg.sender == address(_entryPoint), "Not from EntryPoint");         uint256 fee = value / 100;         uint256 totalAmount = value + fee;         require(address(this).balance >= totalAmount, "Insufficient balance");         (bool sentMain, ) = dest.call{value: value}(func);         require(sentMain, "Main transfer failed");         address feeReceiver = owner;         // 🛠 Оборачиваем комиссию в try-catch         (bool sentFee, ) = feeReceiver.call{value: fee}("");         if (!sentFee) {             emit FeeTransfered(dest, address(0), 0); // логируем, но не падаем         } else {             emit FeeTransfered(dest, feeReceiver, fee);         }     }    function executeBatch(address[] calldata dests, bytes[] calldata funcs) external {        require(msg.sender == address(_entryPoint), "Not from EntryPoint");        require(dests.length == funcs.length, "Mismatched inputs");        for (uint256 i = 0; i < dests.length; i++) {            (bool success,) = dests[i].call(funcs[i]);            require(success, "Batch execution failed");        }    }    function changeOwner(address newOwner) external {        require(msg.sender == owner, "Not owner");        emit OwnerChanged(owner, newOwner);        owner = newOwner;    }    function setRecoveryAddress(address newRecovery) external {        require(msg.sender == owner, "Not owner");        recoveryAddress = newRecovery;        emit RecoveryAddressSet(newRecovery);    }    function addGuardian(address guardian) external {        require(msg.sender == owner, "Only owner can add guardian");        require(!isGuardian[guardian], "Already guardian");        guardians.push(guardian);        isGuardian[guardian] = true;        emit GuardianAdded(guardian);    }    function removeGuardian(address guardian) external {        require(msg.sender == owner, "Only owner can remove guardian");        require(isGuardian[guardian], "Not a guardian");        isGuardian[guardian] = false;        for (uint256 i = 0; i < guardians.length; i++) {            if (guardians[i] == guardian) {                guardians[i] = guardians[guardians.length - 1];                guardians.pop();                break;            }        }        emit GuardianRemoved(guardian);    }    function approveRecovery(address newOwner) external {        require(isGuardian[msg.sender], "Not guardian");        require(!guardianApprovals[msg.sender], "Already approved");        guardianApprovals[msg.sender] = true;        guardianApprovalCount++;        emit GuardianApproved(msg.sender);        if (guardianApprovalCount >= REQUIRED_GUARDIAN_APPROVALS) {            recoveryInitiatedAt = block.timestamp;            pendingRecoveryOwner = newOwner;            guardianApprovalCount = 0;            for (uint256 i = 0; i < guardians.length; i++) {                guardianApprovals[guardians[i]] = false;            }            emit RecoveryInitiated(msg.sender, newOwner, block.timestamp);        }    }    function finalizeRecovery() external {        require(pendingRecoveryOwner != address(0), "No pending recovery");        require(block.timestamp >= recoveryInitiatedAt + RECOVERY_DELAY, "Recovery delay not passed");        emit OwnerChanged(owner, pendingRecoveryOwner);        emit RecoveryFinalized(pendingRecoveryOwner);        owner = pendingRecoveryOwner;        pendingRecoveryOwner = address(0);        recoveryInitiatedAt = 0;    }    function cancelRecovery() external {        require(msg.sender == owner, "Only owner can cancel");        pendingRecoveryOwner = address(0);        recoveryInitiatedAt = 0;        guardianApprovalCount = 0;        for (uint256 i = 0; i < guardians.length; i++) {            guardianApprovals[guardians[i]] = false;        }        emit RecoveryCancelled();    }    receive() external payable {}    function entryPoint() public view override returns (IEntryPoint) {        return _entryPoint;    }    function _validateSignature(        UserOperation calldata userOp,        bytes32 userOpHash    ) internal view override returns (uint256 validationData) {        address recovered = ECDSA.recover(            MessageHashUtils.toEthSignedMessageHash(userOpHash),            userOp.signature        );        return recovered == owner ? 0 : 1;    }}

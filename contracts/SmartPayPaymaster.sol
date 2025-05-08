@@ -18,7 +18,7 @@ contract SmartPayPaymaster is CustomBasePaymaster, Ownable {
         UserOperation calldata userOp,
         bytes32,
         uint256
-    ) internal override returns (bytes memory context, uint256 validationData) {
+    ) internal pure override returns (bytes memory context, uint256 validationData) {
         // Пропускаем всех — можно добавить валидацию
         return (abi.encode(userOp.sender), 0);
     }

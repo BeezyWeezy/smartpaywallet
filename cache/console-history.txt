@@ -1,2 +1,10 @@
+await ethers.provider.getBalance("0xE61574523307226609314aD005B58212774ff50a")
+ethers.utils.formatEther(bal)
+const bal = await ethers.provider.getBalance("0xE61574523307226609314aD005B58212774ff50a")
+> const bal = await ethers.provider.getBalance("0xE61574523307226609314aD005B58212774ff50a")
+(await ethers.provider.getBalance(wallet.address)).toString()
+const wallet = await ethers.getContractAt("SmartPayWallet", "0xE61574523307226609314aD005B58212774ff50a");
+await wallet.owner()
+const wallet = await ethers.getContractAt("SmartPayWallet", "0xE61574523307226609314aD005B58212774ff50a");
 (await ethers.provider.getBalance("0xE61574523307226609314aD005B58212774ff50a")).toString()
 > (await ethers.provider.getBalance("0xE61574523307226609314aD005B58212774ff50a")).toString()

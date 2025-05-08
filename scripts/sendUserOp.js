@@ -11,16 +11,27 @@ async function main() {
     const entryPointAddress = process.env.ENTRY_POINT;
     const walletAddress = process.env.WALLET_ADDRESS;
     const paymasterAddress = process.env.PAYMASTER_ADDRESS;
+    console.log(paymasterAddress);
 
-    const recipient = "0x0574f4e1629f79527f2e0014ef54aec4ebcf4beb";
+    const recipient = "0xB48499F43c5069609256989b1Cf56758F2Cddb13";
     const feeReceiver = signer.address;
 
-    const amount = ethers.utils.parseEther("0.01");
-    const fee = amount.div(100);
+    const amount = ethers.utils.parseEther("0.0005");
+
+    const fee = amount.div(100); // 1%
     const amountToSend = amount.sub(fee);
 
     const iface = new ethers.utils.Interface([
-        "function execute(address dest, uint256 value, bytes calldata func)"
+        "function execute(address dest, uint256 value, bytes calldata func)",
+        "function executeBatch(address[] calldata dests, bytes[] calldata funcs)"
+    ]);
+
+    const callData = iface.encodeFunctionData("executeBatch", [
+        [recipient, feeReceiver],
+        [
+            iface.encodeFunctionData("execute", [recipient, amountToSend, "0x"]),
+            iface.encodeFunctionData("execute", [feeReceiver, fee, "0x"])
+        ]
     ]);
 
     const accountAPI = new SimpleAccountAPI({
@@ -33,33 +44,21 @@ async function main() {
 
     const entryPoint = EntryPoint__factory.connect(entryPointAddress, provider);
 
-    // 🔁 Отправляем основную сумму пользователю
-    const callData1 = iface.encodeFunctionData("execute", [recipient, amountToSend, "0x"]);
-    const userOp1 = await accountAPI.createSignedUserOp({
+    const userOp = await accountAPI.createSignedUserOp({
         target: walletAddress,
-        data: callData1,
-        value: amountToSend,
+        data: callData,
+        value: 0,
         paymasterAndData: paymasterAddress
     });
 
-    console.log(`🚀 Sending 0.099 ETH to recipient: ${recipient}`);
-    const tx1 = await entryPoint.handleOps([await resolveProperties(userOp1)], feeReceiver);
-    await tx1.wait();
-    console.log("✅ First transfer confirmed.");
+    const resolvedOp = await resolveProperties(userOp);
+    const resolvedFeeReceiver = await signer.getAddress(); // обязательно строка
 
-    // 🔁 Отправляем комиссию себе
-    const callData2 = iface.encodeFunctionData("execute", [feeReceiver, fee, "0x"]);
-    const userOp2 = await accountAPI.createSignedUserOp({
-        target: walletAddress,
-        data: callData2,
-        value: fee,
-        paymasterAndData: paymasterAddress
-    });
+    const tx = await entryPoint.handleOps([resolvedOp], resolvedFeeReceiver);
 
-    console.log(`💰 Sending 1% fee (${ethers.utils.formatEther(fee)} ETH) to yourself`);
-    const tx2 = await entryPoint.handleOps([await resolveProperties(userOp2)], feeReceiver);
-    await tx2.wait();
-    console.log("✅ Fee transfer confirmed.");
+    console.log("🚀 Sending UserOperation with 1% fee split...");
+    await tx.wait();
+    console.log("✅ Transaction confirmed.");
 }
 
 main().catch((err) => {
